@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.zip
+results/
+CLAUDE.md
+.DS_Store
