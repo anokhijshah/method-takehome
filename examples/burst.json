@@ -1,0 +1,9 @@
+[
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --top-ports 100 --target 128.199.158.128"},
+  {"cli": "networkscan", "command": "discover port --ports 22,80,443 --target 128.199.158.128"}
+]
