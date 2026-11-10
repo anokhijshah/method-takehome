@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Elastic networkscan cloud agent pool. Jobs are sent to an SQS queue; a Lambda dispatcher
+  launches one Fargate task per job; each task runs Method's networkscan container plus an
+  uploader sidecar that copies output.json to S3. Scales to zero when idle. One stack = one
+  agent pool in one Region.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for scan tasks.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (route to an internet gateway). Tasks get a public IP for egress.
+  NetworkscanImage:
+    Type: String
+    Default: methodsecurity/networkscan:0.21.0
+    Description: Pinned networkscan image.
+  UploaderImage:
+    Type: String
+    Default: public.ecr.aws/aws-cli/aws-cli:2.39.7
+    Description: Pinned AWS CLI image for the result-upload sidecar.
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: Must be a valid Fargate pairing with TaskCpu.
+  DispatcherMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 1000
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+  ResultRetentionDays:
+    Type: Number
+    Default: 30
+
+Resources:
+  # ---------- Results storage ----------
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Central location for every job's output.json (results/<job_id>/output.json).
+        must: Stays private and encrypted; scan results describe exposed hosts.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-results
+            Status: Enabled
+            ExpirationInDays: !Ref ResultRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub "${ResultsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------- Job queue ----------
+  JobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Holds jobs that failed to launch after maxReceiveCount attempts, for inspection/redrive.
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Buffers bursts of jobs so submission is async and launches are retried.
+        must: >-
+          VisibilityTimeout >= 6x dispatcher timeout. maxReceiveCount is high so bursts above the
+          Fargate vCPU quota wait for capacity instead of dead-lettering.
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs"
+      VisibilityTimeout: 180
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobsDeadLetterQueue.Arn
+        maxReceiveCount: 10
+
+  JobsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        must: SQS requires exactly one Resource per statement, so each queue has its own policy.
+    Properties:
+      Queues: [!Ref JobsQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt JobsQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  JobsDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref JobsDeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt JobsDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-jobs-dead-lettered"
+      AlarmDescription: A job failed to launch repeatedly and was moved to the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt JobsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ---------- Scan agents (ECS Fargate) ----------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+
+  ScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Scan tasks need unrestricted egress to reach targets; nothing needs to reach them.
+        must: No ingress rules, ever.
+    Properties:
+      GroupDescription: networkscan agents - egress only
+      VpcId: !Ref VpcId
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Used by Fargate to pull images and write container logs.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Identity of the running containers; only the uploader uses it.
+        must: Write-only to results/ prefix. Scanner gets no other AWS access.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: upload-results
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ResultsBucket.Arn}/results/*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          networkscan writes output.json to a shared ephemeral volume; the uploader sidecar waits
+          for it to exit (COMPLETE), then copies the file to S3. Keeps Method's image unmodified.
+        must: Container names must match SCAN_CONTAINER / UPLOAD_CONTAINER in the dispatcher.
+    Properties:
+      Family: !Sub "${AWS::StackName}-networkscan"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      Volumes:
+        - Name: output
+      ContainerDefinitions:
+        - Name: networkscan
+          Image: !Ref NetworkscanImage
+          Essential: false
+          MountPoints:
+            - SourceVolume: output
+              ContainerPath: /mnt/output
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ScanLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: scan
+        - Name: uploader
+          Image: !Ref UploaderImage
+          Essential: true
+          DependsOn:
+            - ContainerName: networkscan
+              Condition: COMPLETE
+          EntryPoint: ["sh", "-c"]
+          Command:
+            - >-
+              DEST="s3://$RESULTS_BUCKET/results/$JOB_ID/output.json";
+              if [ -s /mnt/output/output.json ]; then
+              aws s3 cp /mnt/output/output.json "$DEST" --only-show-errors && echo "UPLOADED $DEST";
+              else echo "NO_OUTPUT job=$JOB_ID"; exit 2; fi
+          Environment:
+            - Name: RESULTS_BUCKET
+              Value: !Ref ResultsBucket
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          MountPoints:
+            - SourceVolume: output
+              ContainerPath: /mnt/output
+              ReadOnly: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ScanLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: upload
+
+  # ---------- Dispatcher (SQS -> Lambda -> RunTask) ----------
+  DispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-dispatcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        must: >-
+          Least privilege. RunTask only for this task family on this cluster; PassRole only
+          for the two task roles and only to ecs-tasks.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: dispatcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ConsumeJobQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt JobsQueue.Arn
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DispatcherLogGroup.Arn
+              - Sid: LaunchScanTasks
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-networkscan:*"
+                Condition:
+                  ArnEquals: { ecs:cluster: !GetAtt Cluster.Arn }
+              - Sid: PassTaskRolesToEcs
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+                Condition:
+                  StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com }
+
+  DispatcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-dispatcher"
+      Description: Launches one Fargate networkscan task per SQS job.
+      Runtime: python3.13
+      Handler: handler.handler
+      Code: ../dispatcher
+      Role: !GetAtt DispatcherRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref DispatcherLogGroup
+      Environment:
+        Variables:
+          CLUSTER: !Ref Cluster
+          TASK_DEFINITION: !Ref TaskDefinition
+          SCAN_CONTAINER: networkscan
+          UPLOAD_CONTAINER: uploader
+          SUBNETS: !Join [",", !Ref SubnetIds]
+          SECURITY_GROUP: !Ref TaskSecurityGroup
+
+  DispatcherEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Batches of 10 with partial-failure reporting so only failed launches retry.
+          MaximumConcurrency caps RunTask call rate; the real ceiling is the Fargate vCPU quota.
+    Properties:
+      EventSourceArn: !GetAtt JobsQueue.Arn
+      FunctionName: !Ref DispatcherFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: !Ref DispatcherMaxConcurrency
+
+  # ---------- Job completion log ----------
+  JobEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/events/${AWS::StackName}-jobs"
+      RetentionInDays: !Ref LogRetentionDays
+
+  JobCompleteRule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Durable "job complete" record (job id = startedBy, per-container exit codes).
+    Properties:
+      Name: !Sub "${AWS::StackName}-job-complete"
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+          lastStatus: [STOPPED]
+      Targets:
+        - Id: job-log
+          Arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${JobEventsLogGroup}"
+
+  JobEventsLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-events-to-logs"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${JobEventsLogGroup.Arn}",
+            "Condition": {"ArnEquals": {"aws:SourceArn": "${JobCompleteRule.Arn}"}}
+          }]
+        }
+
+Outputs:
+  JobsQueueUrl:
+    Value: !Ref JobsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref JobsDeadLetterQueue
+  ResultsBucketName:
+    Value: !Ref ResultsBucket
+  ClusterName:
+    Value: !Ref Cluster
+  ScanLogGroupName:
+    Value: !Ref ScanLogGroup
+  JobEventsLogGroupName:
+    Value: !Ref JobEventsLogGroup
